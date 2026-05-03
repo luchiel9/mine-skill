@@ -72,6 +72,8 @@ class ValidatorRuntime:
         self._max_concurrent = MAX_CONCURRENT
         self._eval_semaphore = threading.Semaphore(self._max_concurrent)
         self._eval_executor: ThreadPoolExecutor | None = None
+        self._inflight_tasks: set[str] = set()  # task IDs currently being processed
+        self._inflight_lock = threading.Lock()
 
         self._stats_lock = threading.Lock()
         self._stats: dict[str, int] = {
@@ -375,19 +377,10 @@ class ValidatorRuntime:
         )
         self._main_thread.start()
 
-        # Auto-updater — pulls from upstream on new commits, triggers graceful stop
-        try:
-            from auto_updater import AutoUpdater
-            from pathlib import Path as _Path
-            project_root = _Path(__file__).resolve().parents[1]
-            self._auto_updater = AutoUpdater(
-                project_root,
-                on_update_applied=self._on_auto_update_applied,
-            )
-            self._auto_updater.start()
-        except Exception as exc:
-            log.warning("Auto-updater start failed: %s", exc)
-            self._auto_updater = None
+        # Auto-updater disabled — local patches (trust_env, ws_client, etc.)
+        # get wiped by upstream pulls. Update manually when needed.
+        self._auto_updater = None
+        log.info("Auto-update disabled (local patches active)")
 
         self._record_action("started")
         self._write_status()
@@ -541,12 +534,21 @@ class ValidatorRuntime:
                 if paused:
                     log.info("Paused — ignoring evaluation_task %s", msg.assignment_id)
                     continue
+                # Deduplicate — skip if already in-flight
+                task_id = msg.task_id
+                with self._inflight_lock:
+                    if task_id in self._inflight_tasks:
+                        log.debug("Task %s already in-flight — skipping duplicate", task_id)
+                        continue
+                    self._inflight_tasks.add(task_id)
                 if self._max_concurrent > 1:
-                    # Dispatch concurrently — non-blocking if slots available
                     if self._eval_semaphore.acquire(blocking=False):
                         self._eval_executor.submit(self._run_evaluation, msg)  # type: ignore[union-attr]
                     else:
-                        log.info("All %d eval slots busy — skipping task %s", self._max_concurrent, msg.task_id)
+                        # Release from inflight since we're not processing it
+                        with self._inflight_lock:
+                            self._inflight_tasks.discard(task_id)
+                        log.info("All %d eval slots busy — skipping task %s", self._max_concurrent, task_id)
                 else:
                     self._run_evaluation(msg)
 
@@ -600,6 +602,8 @@ class ValidatorRuntime:
                     self._send_notification(alert)
         finally:
             self._set_phase("waiting_for_task")
+            with self._inflight_lock:
+                self._inflight_tasks.discard(msg.task_id)
             if self._max_concurrent > 1:
                 self._eval_semaphore.release()
 
@@ -642,6 +646,9 @@ class ValidatorRuntime:
                 error_str = str(exc)
                 if "404" not in error_str and "409" not in error_str:
                     log.warning("HTTP poll claim failed: %s", exc)
+                # Back off on server errors (502, 503, timeout) to avoid hammering
+                if any(code in error_str for code in ("502", "503", "timed out", "Temporary failure")):
+                    self._stop_event.wait(timeout=30)
                 return
         log.warning("HTTP poll: PoW retry limit reached (3 attempts) without claiming a task")
 

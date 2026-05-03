@@ -25,8 +25,11 @@ log = logging.getLogger("validator.ws")
 PING_INTERVAL = 20.0
 PING_TIMEOUT = 10.0
 
-# If no data (messages or pongs) received for this long, consider connection stale
-STALE_CONNECTION_TIMEOUT = 90.0
+# If no data (messages or pongs) received for this long, consider connection stale.
+# The library-level ping/pong (20s interval, 10s timeout) already detects dead
+# connections within ~30s. This is a secondary safety net for edge cases where
+# pings succeed but the server stops sending real data.
+STALE_CONNECTION_TIMEOUT = 300.0
 
 
 class WSDisconnected(Exception):
