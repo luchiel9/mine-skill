@@ -522,6 +522,9 @@ class ValidatorRuntime:
                 continue
 
             if msg is None:
+                # No WS message within timeout — opportunistic HTTP poll
+                # to catch tasks missed during brief WS instability
+                self._poll_evaluation_task_http()
                 continue
 
             # Successful receive — reset WS failure counter
