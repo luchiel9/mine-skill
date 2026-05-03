@@ -16,6 +16,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,8 +34,9 @@ _HTTPStatusError = httpx.HTTPStatusError
 
 log = logging.getLogger("validator.runtime")
 
-HEARTBEAT_INTERVAL = 55
-WS_RECEIVE_TIMEOUT = 30.0
+HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_SECS", "55"))
+WS_RECEIVE_TIMEOUT = float(os.environ.get("POLL_INTERVAL", "30"))
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "1"))
 FALLBACK_ALERT_THRESHOLD = 5
 
 
@@ -65,6 +67,11 @@ class ValidatorRuntime:
         self._main_thread: threading.Thread | None = None
         self._auto_updater: Any = None
         self._stop_event = threading.Event()
+
+        # Concurrent evaluation
+        self._max_concurrent = MAX_CONCURRENT
+        self._eval_semaphore = threading.Semaphore(self._max_concurrent)
+        self._eval_executor: ThreadPoolExecutor | None = None
 
         self._stats_lock = threading.Lock()
         self._stats: dict[str, int] = {
@@ -281,7 +288,10 @@ class ValidatorRuntime:
             self._paused = False
             self._stop_event.clear()
 
-        log.info("ValidatorRuntime starting (id=%s)", self._validator_id)
+        log.info(
+            "ValidatorRuntime starting (id=%s, heartbeat=%ds, poll=%ds, max_concurrent=%d)",
+            self._validator_id, self._heartbeat_interval, int(WS_RECEIVE_TIMEOUT), self._max_concurrent,
+        )
 
         # Optionally initialize OpenClaw agent workspace. This is only needed
         # when the CLI path is actually available — the evaluation engine
@@ -297,6 +307,9 @@ class ValidatorRuntime:
                 log.info("OpenClaw CLI not installed — using llm_enrich gateway/API routing for evaluation")
         except Exception as exc:
             log.warning("OpenClaw init skipped: %s", exc)
+
+        # Quick LLM connectivity check — fail fast if the local router is down
+        self._preflight_llm_check()
 
         # Restore stats from previous run (#9)
         self._restore_stats()
@@ -344,6 +357,13 @@ class ValidatorRuntime:
             log.warning("Initial WS connect failed; will retry in main loop")
 
         self._try_join_ready_pool(initial=True)
+
+        # Start concurrent evaluation executor if max_concurrent > 1
+        if self._max_concurrent > 1:
+            self._eval_executor = ThreadPoolExecutor(
+                max_workers=self._max_concurrent, thread_name_prefix="eval"
+            )
+            log.info("Concurrent evaluation enabled: max_concurrent=%d", self._max_concurrent)
 
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop, name="validator-heartbeat", daemon=True
@@ -405,6 +425,10 @@ class ValidatorRuntime:
             log.warning("leave_ready_pool failed: %s", exc)
 
         self._ws.close()
+
+        if self._eval_executor is not None:
+            self._eval_executor.shutdown(wait=True, cancel_futures=True)
+            self._eval_executor = None
 
         if self._heartbeat_thread and self._heartbeat_thread.is_alive():
             self._heartbeat_thread.join(timeout=10)
@@ -514,23 +538,14 @@ class ValidatorRuntime:
                 if paused:
                     log.info("Paused — ignoring evaluation_task %s", msg.assignment_id)
                     continue
-                try:
-                    self._set_phase("evaluating", f"task {msg.task_id}")
-                    self._handle_evaluation_task(msg)
-                except Exception as exc:
-                    self._inc_stat("errors")
-                    self._inc_stat("consecutive_failures")
-                    log.error("Error handling evaluation task %s: %s", msg.assignment_id, exc)
-                    self._record_action(f"error: {exc}", {"task_id": msg.task_id})
-                    # Alert on consecutive failures (#1)
-                    consec = self._get_stat("consecutive_failures")
-                    if consec >= FALLBACK_ALERT_THRESHOLD:
-                        if consec % FALLBACK_ALERT_THRESHOLD == 0:
-                            alert = f"WARNING: {consec} consecutive evaluation failures!"
-                            log.warning(alert)
-                            self._send_notification(alert)
-                finally:
-                    self._set_phase("waiting_for_task")
+                if self._max_concurrent > 1:
+                    # Dispatch concurrently — non-blocking if slots available
+                    if self._eval_semaphore.acquire(blocking=False):
+                        self._eval_executor.submit(self._run_evaluation, msg)  # type: ignore[union-attr]
+                    else:
+                        log.info("All %d eval slots busy — skipping task %s", self._max_concurrent, msg.task_id)
+                else:
+                    self._run_evaluation(msg)
 
             elif msg.type == "cooldown":
                 # Platform signals post-task cooldown with a precise sleep
@@ -563,6 +578,27 @@ class ValidatorRuntime:
 
         log.info("Main loop exited")
         self._write_status()
+
+    def _run_evaluation(self, msg: WSMessage) -> None:
+        """Execute a single evaluation task (may run in thread pool)."""
+        try:
+            self._set_phase("evaluating", f"task {msg.task_id}")
+            self._handle_evaluation_task(msg)
+        except Exception as exc:
+            self._inc_stat("errors")
+            self._inc_stat("consecutive_failures")
+            log.error("Error handling evaluation task %s: %s", msg.assignment_id, exc)
+            self._record_action(f"error: {exc}", {"task_id": msg.task_id})
+            consec = self._get_stat("consecutive_failures")
+            if consec >= FALLBACK_ALERT_THRESHOLD:
+                if consec % FALLBACK_ALERT_THRESHOLD == 0:
+                    alert = f"WARNING: {consec} consecutive evaluation failures!"
+                    log.warning(alert)
+                    self._send_notification(alert)
+        finally:
+            self._set_phase("waiting_for_task")
+            if self._max_concurrent > 1:
+                self._eval_semaphore.release()
 
     def _poll_evaluation_task_http(self) -> None:
         """HTTP polling fallback when WS is unavailable."""
@@ -846,6 +882,45 @@ class ValidatorRuntime:
         except Exception as exc:
             log.error("LLM solve failed: %s", exc)
             return ""
+
+    def _preflight_llm_check(self) -> None:
+        """Quick LLM connectivity check at startup.
+
+        Sends a minimal prompt to verify the local LLM router is reachable.
+        Logs a clear warning if it fails — does not block startup.
+        """
+        import asyncio
+
+        model_config = getattr(self._engine, "model_config", None)
+        if not model_config:
+            log.warning("LLM preflight: no model_config — skipping check")
+            return
+
+        try:
+            from crawler.enrich.generative.llm_enrich import enrich_with_llm
+
+            async def _ping() -> None:
+                result = await enrich_with_llm(
+                    "hi",
+                    model_config=model_config,
+                    timeout=15.0,
+                )
+                if result.success:
+                    log.info("LLM preflight OK (method=%s, model=%s)", result.method, result.model)
+                else:
+                    log.error("LLM preflight FAILED: %s — evaluations will fail until resolved", result.error)
+
+            from evaluation_engine import _LLM_EXECUTOR
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    _LLM_EXECUTOR.submit(lambda: asyncio.run(_ping())).result(timeout=20)
+                else:
+                    asyncio.run(_ping())
+            except RuntimeError:
+                asyncio.run(_ping())
+        except Exception as exc:
+            log.error("LLM preflight FAILED: %s — evaluations will fail until resolved", exc)
 
     def _heartbeat_loop(self) -> None:
         """Send periodic heartbeats to the platform.

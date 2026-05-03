@@ -77,7 +77,8 @@ class LLMClient:
         )
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            # trust_env=False: LLM endpoint is a local router, never use HTTP_PROXY
+            async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
                 response = await client.post(url, headers=headers, json=payload)
                 response.raise_for_status()
                 data = response.json()
