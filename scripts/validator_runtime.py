@@ -631,7 +631,14 @@ class ValidatorRuntime:
                         log.info("PoW passed — retrying claim")
                         continue  # retry claim in next loop iteration
                     return  # PoW failed — next claim will return 409 cooldown
-                # Normal claim success
+                # Normal claim success — dedup by task_id
+                polled_task_id = str(claim_data.get("task_id") or "")
+                if polled_task_id:
+                    with self._inflight_lock:
+                        if polled_task_id in self._inflight_tasks:
+                            log.debug("HTTP poll got task %s already in-flight — skipping", polled_task_id)
+                            return
+                        self._inflight_tasks.add(polled_task_id)
                 msg = WSMessage({"type": "evaluation_task", "data": claim_data})
                 self._inc_stat("tasks_received")
                 try:
@@ -641,6 +648,10 @@ class ValidatorRuntime:
                     self._inc_stat("consecutive_failures")
                     log.error("HTTP fallback eval failed: %s", eval_exc)
                     self._write_status()
+                finally:
+                    if polled_task_id:
+                        with self._inflight_lock:
+                            self._inflight_tasks.discard(polled_task_id)
                 return
             except Exception as exc:
                 error_str = str(exc)
