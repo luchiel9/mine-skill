@@ -667,40 +667,54 @@ class ValidatorRuntime:
             # HTTP polling path — msg.data already contains full claim response
             claim_data = msg.data
         else:
-            # WS path — must call HTTP claim to get assignment_id + data
-            try:
-                with self._platform_lock:
-                    claim_data = self._platform.claim_evaluation_task()
-                if not claim_data:
-                    log.warning("Claim returned no data for task %s", task_id)
-                    return
-                if claim_data.get("_cooldown"):
-                    retry_after = int(claim_data.get("retry_after_seconds", 30))
-                    log.info("Validator cooldown on WS claim: sleeping %ds", retry_after)
-                    self._stop_event.wait(timeout=retry_after)
-                    return
-                # 428 PoW required — solve and retry claim
-                if claim_data.get("_pow_required"):
-                    if self._handle_pow_challenge(claim_data):
-                        log.info("PoW passed — retrying claim for task %s", task_id)
-                        with self._platform_lock:
-                            claim_data = self._platform.claim_evaluation_task()
-                        if not claim_data:
-                            log.info("No task available after PoW pass")
-                            return
-                        if claim_data.get("_cooldown"):
-                            retry = int(claim_data.get("retry_after_seconds", 30))
-                            log.info("Cooldown after PoW retry: %ds", retry)
-                            self._stop_event.wait(timeout=retry)
-                            return
-                        if claim_data.get("_pow_required"):
-                            log.warning("Second PoW challenge on retry — dropping")
+            # WS path — must call HTTP claim to get assignment_id + data.
+            # Retry up to 3 times on transient failures (proxy timeout, etc.)
+            claim_data = None
+            for claim_attempt in range(3):
+                try:
+                    with self._platform_lock:
+                        claim_data = self._platform.claim_evaluation_task()
+                    break  # success
+                except Exception as exc:
+                    if claim_attempt < 2:
+                        wait = 2 ** claim_attempt  # 1s, 2s
+                        log.warning(
+                            "HTTP claim for task %s failed (attempt %d/3): %s — retrying in %ds",
+                            task_id, claim_attempt + 1, exc, wait,
+                        )
+                        if self._stop_event.wait(timeout=wait):
                             return
                     else:
+                        log.warning("HTTP claim for task %s failed after 3 attempts: %s", task_id, exc)
                         return
-            except Exception as exc:
-                log.warning("HTTP claim for task %s failed: %s", task_id, exc)
+
+            if not claim_data:
+                log.warning("Claim returned no data for task %s", task_id)
                 return
+            if claim_data.get("_cooldown"):
+                retry_after = int(claim_data.get("retry_after_seconds", 30))
+                log.info("Validator cooldown on WS claim: sleeping %ds", retry_after)
+                self._stop_event.wait(timeout=retry_after)
+                return
+            # 428 PoW required — solve and retry claim
+            if claim_data.get("_pow_required"):
+                if self._handle_pow_challenge(claim_data):
+                    log.info("PoW passed — retrying claim for task %s", task_id)
+                    with self._platform_lock:
+                        claim_data = self._platform.claim_evaluation_task()
+                    if not claim_data:
+                        log.info("No task available after PoW pass")
+                        return
+                    if claim_data.get("_cooldown"):
+                        retry = int(claim_data.get("retry_after_seconds", 30))
+                        log.info("Cooldown after PoW retry: %ds", retry)
+                        self._stop_event.wait(timeout=retry)
+                        return
+                    if claim_data.get("_pow_required"):
+                        log.warning("Second PoW challenge on retry — dropping")
+                        return
+                else:
+                    return
 
         assignment_id = str(claim_data.get("assignment_id") or "")
         task_id = str(claim_data.get("task_id") or task_id)
@@ -732,13 +746,30 @@ class ValidatorRuntime:
         )
         self._inc_stat("tasks_evaluated")
 
-        # Step 4: Report with result (match/mismatch) and score
-        with self._platform_lock:
-            self._platform.report_evaluation(
-                task_id, eval_result.score,
-                assignment_id=assignment_id,
-                result=eval_result.result,
-            )
+        # Step 4: Report with result (match/mismatch) and score.
+        # Retry up to 3 times — evaluation is done, losing the report wastes work.
+        for report_attempt in range(3):
+            try:
+                with self._platform_lock:
+                    self._platform.report_evaluation(
+                        task_id, eval_result.score,
+                        assignment_id=assignment_id,
+                        result=eval_result.result,
+                    )
+                break
+            except Exception as exc:
+                if report_attempt < 2:
+                    wait = 2 ** report_attempt
+                    log.warning(
+                        "Report for task %s failed (attempt %d/3): %s — retrying in %ds",
+                        task_id, report_attempt + 1, exc, wait,
+                    )
+                    if self._stop_event.wait(timeout=wait):
+                        return
+                else:
+                    log.error("Report for task %s failed after 3 attempts: %s — result lost", task_id, exc)
+                    self._inc_stat("errors")
+                    return
 
         # Reset consecutive failures on success (#1)
         self._set_stat("consecutive_failures", 0)
