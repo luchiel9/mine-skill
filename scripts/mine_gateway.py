@@ -22,7 +22,7 @@ def resolve_mine_gateway_model_config() -> dict[str, Any]:
         return {}
 
     config: dict[str, Any] = {
-        "provider": "openclaw",
+        "provider": _env_value("MINE_GATEWAY_PROVIDER", "OPENCLAW_GATEWAY_PROVIDER", default="openclaw"),
         "base_url": _env_value("MINE_GATEWAY_BASE_URL", "OPENCLAW_GATEWAY_BASE_URL", default=DEFAULT_GATEWAY_BASE_URL),
         "api_key": token,
         "model": _env_value("MINE_ENRICH_MODEL", "OPENCLAW_ENRICH_MODEL", default=DEFAULT_GATEWAY_MODEL),

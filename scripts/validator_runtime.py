@@ -343,27 +343,7 @@ class ValidatorRuntime:
         except WSDisconnected:
             log.warning("Initial WS connect failed; will retry in main loop")
 
-        try:
-            with self._platform_lock:
-                self._platform.join_ready_pool()
-            with self._lock:
-                self._in_ready_pool = True
-            log.info("Joined validator ready pool")
-        except (PlatformApiError, _HTTPStatusError) as err:
-            status_code = err.status_code if isinstance(err, PlatformApiError) else err.response.status_code
-            error_msg = str(err)
-            if status_code == 403:
-                log.error(
-                    "Failed to join validator ready pool (403 Forbidden): %s. "
-                    "This may indicate insufficient stake (minimum 10,000 AWP on Mine Worknet, "
-                    "may increase as more validators join). Stake must remain allocated "
-                    "continuously — withdrawal causes eviction. Will retry on next heartbeat.",
-                    error_msg,
-                )
-            else:
-                log.warning("join_ready_pool failed: %s", err)
-        except Exception as exc:
-            log.warning("join_ready_pool failed: %s", exc)
+        self._try_join_ready_pool(initial=True)
 
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop, name="validator-heartbeat", daemon=True
@@ -889,18 +869,55 @@ class ValidatorRuntime:
             with self._lock:
                 in_pool = self._in_ready_pool
             if not in_pool:
-                try:
-                    with self._platform_lock:
-                        self._platform.join_ready_pool()
-                    with self._lock:
-                        self._in_ready_pool = True
-                    log.info("Successfully joined ready pool on retry")
-                except Exception as exc:
-                    log.warning("Ready pool retry failed: %s", exc)
+                self._try_join_ready_pool(initial=False)
             self._write_status()
             if self._stop_event.wait(timeout=self._heartbeat_interval):
                 break
         log.info("Heartbeat loop exited")
+
+    def _try_join_ready_pool(self, *, initial: bool) -> None:
+        for attempt in range(3):
+            try:
+                with self._platform_lock:
+                    join_data = self._platform.join_ready_pool()
+                if isinstance(join_data, dict) and join_data.get("_pow_required"):
+                    if self._handle_pow_challenge(join_data):
+                        log.info("PoW passed — retrying ready-pool join")
+                        continue
+                    return
+                with self._lock:
+                    self._in_ready_pool = True
+                if initial:
+                    log.info("Joined validator ready pool")
+                else:
+                    log.info("Successfully joined ready pool on retry")
+                return
+            except (PlatformApiError, _HTTPStatusError) as err:
+                status_code = err.status_code if isinstance(err, PlatformApiError) else err.response.status_code
+                error_msg = str(err)
+                if status_code == 403:
+                    log.error(
+                        "Failed to join validator ready pool (403 Forbidden): %s. "
+                        "This may indicate insufficient stake (minimum 10,000 AWP on Mine Worknet, "
+                        "may increase as more validators join). Stake must remain allocated "
+                        "continuously — withdrawal causes eviction. Will retry on next heartbeat.",
+                        error_msg,
+                    )
+                elif status_code == 409:
+                    log.info("Validator not ready to join pool yet: %s", error_msg)
+                else:
+                    if initial:
+                        log.warning("join_ready_pool failed: %s", err)
+                    else:
+                        log.warning("Ready pool retry failed: %s", err)
+                return
+            except Exception as exc:
+                if initial:
+                    log.warning("join_ready_pool failed: %s", exc)
+                else:
+                    log.warning("Ready pool retry failed: %s", exc)
+                return
+        log.warning("Ready pool join PoW retry limit reached (3 attempts)")
 
     def _send_heartbeat(self) -> None:
         """Send a single heartbeat and update runtime state from response."""

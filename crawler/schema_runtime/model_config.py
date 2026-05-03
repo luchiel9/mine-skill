@@ -34,7 +34,7 @@ def _try_load_openclaw_model_config() -> dict[str, Any]:
     if not token:
         return {}
     return {
-        "provider": "openclaw",
+        "provider": _env_value("MINE_GATEWAY_PROVIDER", "OPENCLAW_GATEWAY_PROVIDER", default="openclaw"),
         "base_url": _env_value("MINE_GATEWAY_BASE_URL", "OPENCLAW_GATEWAY_BASE_URL", default="http://127.0.0.1:18789/v1"),
         "api_key": token,
         "model": _env_value("MINE_GATEWAY_MODEL", "OPENCLAW_GATEWAY_MODEL", default="openclaw/default"),

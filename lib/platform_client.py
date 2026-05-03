@@ -475,8 +475,33 @@ class PlatformClient:
         return self._request_optional_data("GET", "/api/iam/v1/validator-applications/me")
 
     def join_ready_pool(self) -> dict[str, Any]:
-        """POST /api/mining/v1/validators/ready"""
-        return self._request("POST", "/api/mining/v1/validators/ready", {})
+        """POST /api/mining/v1/validators/ready.
+
+        Returns normal ready-pool data, or a PoW sentinel ``{"_pow_required": True, ...}``
+        when the platform responds with 428 ``pow_required``.
+        """
+        try:
+            payload = self._request("POST", "/api/mining/v1/validators/ready", {})
+        except PlatformApiError as api_err:
+            if api_err.status_code == 428:
+                body = api_err.response if isinstance(api_err.response, dict) else {}
+                data = body.get("data") if isinstance(body, dict) else {}
+                if isinstance(data, dict) and data.get("pow_required"):
+                    return {"_pow_required": True, **data}
+            raise
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code == 428:
+                try:
+                    body = error.response.json()
+                except ValueError:
+                    return {}
+                data = body.get("data") if isinstance(body, dict) else {}
+                if isinstance(data, dict) and data.get("pow_required"):
+                    return {"_pow_required": True, **data}
+                return {}
+            raise
+        data = payload.get("data")
+        return data if isinstance(data, dict) else {}
 
     def leave_ready_pool(self) -> dict[str, Any]:
         """POST /api/mining/v1/validators/unready"""
