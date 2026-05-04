@@ -74,6 +74,7 @@ class ValidatorRuntime:
         self._eval_executor: ThreadPoolExecutor | None = None
         self._inflight_tasks: set[str] = set()  # task IDs currently being processed
         self._inflight_lock = threading.Lock()
+        self._reported_assignments: set[str] = set()  # assignment IDs already reported (dedup)
 
         self._stats_lock = threading.Lock()
         self._stats: dict[str, int] = {
@@ -749,6 +750,20 @@ class ValidatorRuntime:
         if not assignment_id:
             log.warning("No assignment_id from claim for task %s — cannot report", task_id)
             return
+
+        # Dedup: skip if this assignment was already reported (prevents double
+        # evaluation when both WS and HTTP poll claim the same task concurrently)
+        with self._inflight_lock:
+            if assignment_id in self._reported_assignments:
+                log.debug("Assignment %s already reported — skipping duplicate", assignment_id)
+                return
+            self._reported_assignments.add(assignment_id)
+            # Cap set size to prevent unbounded growth
+            if len(self._reported_assignments) > 500:
+                # Keep most recent 250
+                to_remove = list(self._reported_assignments)[:250]
+                for item in to_remove:
+                    self._reported_assignments.discard(item)
 
         log.info("Task claimed: task=%s assignment=%s dataset=%s", task_id, assignment_id, dataset_id)
 
