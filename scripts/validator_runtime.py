@@ -35,7 +35,7 @@ _HTTPStatusError = httpx.HTTPStatusError
 log = logging.getLogger("validator.runtime")
 
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_SECS", "55"))
-WS_RECEIVE_TIMEOUT = float(os.environ.get("POLL_INTERVAL", "30"))
+WS_RECEIVE_TIMEOUT = float(os.environ.get("POLL_INTERVAL", "10"))
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "1"))
 FALLBACK_ALERT_THRESHOLD = 5
 
@@ -782,9 +782,34 @@ class ValidatorRuntime:
         )
         self._inc_stat("tasks_evaluated")
 
-        # Step 4: Report with result (match/mismatch) and score.
-        # Retry up to 3 times — evaluation is done, losing the report wastes work.
-        for report_attempt in range(3):
+        # Step 4: Report in background thread so WS loop stays responsive.
+        threading.Thread(
+            target=self._report_with_retry,
+            args=(task_id, assignment_id, dataset_id, eval_result),
+            daemon=True,
+            name=f"report-{task_id[:8]}",
+        ).start()
+
+        # Step 5: Wait min_task_interval before accepting next task.
+        # The platform may also send a WS "cooldown" message with a precise
+        # retry_after_seconds — that is handled in _main_loop and overrides
+        # this local interval. This sleep is the fallback when no WS cooldown
+        # message arrives.
+        with self._lock:
+            wait_seconds = self._min_task_interval
+        if wait_seconds > 0:
+            log.info("Waiting %ds (min_task_interval) before next task", wait_seconds)
+            self._set_phase("cooldown", f"{wait_seconds}s (min_task_interval)")
+            self._stop_event.wait(timeout=wait_seconds)
+
+    # ------------------------------------------------------------------
+    # Report submission (background thread)
+    # ------------------------------------------------------------------
+
+    def _report_with_retry(self, task_id: str, assignment_id: str, dataset_id: str, eval_result: Any) -> None:
+        """Submit evaluation report with retries. Runs in background thread."""
+        max_report_attempts = 10
+        for report_attempt in range(max_report_attempts):
             try:
                 with self._platform_lock:
                     self._platform.report_evaluation(
@@ -794,20 +819,22 @@ class ValidatorRuntime:
                     )
                 break
             except Exception as exc:
-                if report_attempt < 2:
-                    wait = 2 ** report_attempt
+                if report_attempt < max_report_attempts - 1:
+                    wait = min(2 ** report_attempt, 5)  # cap at 5s
                     log.warning(
-                        "Report for task %s failed (attempt %d/3): %s — retrying in %ds",
-                        task_id, report_attempt + 1, exc, wait,
+                        "Report for task %s failed (attempt %d/%d): %s — retrying in %ds",
+                        task_id, report_attempt + 1, max_report_attempts, exc, wait,
                     )
                     if self._stop_event.wait(timeout=wait):
                         return
                 else:
-                    log.error("Report for task %s failed after 3 attempts: %s — result lost", task_id, exc)
+                    log.error("Report for task %s failed after %d attempts: %s — result lost", task_id, max_report_attempts, exc)
                     self._inc_stat("errors")
                     return
+        else:
+            return  # should not reach here
 
-        # Reset consecutive failures on success (#1)
+        # Report succeeded
         self._set_stat("consecutive_failures", 0)
 
         if eval_result.result == "match":
@@ -835,18 +862,6 @@ class ValidatorRuntime:
             "score": eval_result.score,
         })
         self._write_status()
-
-        # Step 5: Wait min_task_interval before accepting next task.
-        # The platform may also send a WS "cooldown" message with a precise
-        # retry_after_seconds — that is handled in _main_loop and overrides
-        # this local interval. This sleep is the fallback when no WS cooldown
-        # message arrives.
-        with self._lock:
-            wait_seconds = self._min_task_interval
-        if wait_seconds > 0:
-            log.info("Waiting %ds (min_task_interval) before next task", wait_seconds)
-            self._set_phase("cooldown", f"{wait_seconds}s (min_task_interval)")
-            self._stop_event.wait(timeout=wait_seconds)
 
     # ------------------------------------------------------------------
     # PoW (Proof of Work) challenge handling

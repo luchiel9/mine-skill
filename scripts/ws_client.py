@@ -111,7 +111,7 @@ class ValidatorWSClient:
         self._ws: Any = None  # websockets connection object
         self._connected = False
         self._reconnect_attempt = 0
-        self._max_backoff = 60
+        self._max_backoff = 10
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._closed = False
