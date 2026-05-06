@@ -13,6 +13,7 @@ from common import (
     WALLET_SESSION_DURATION_SECONDS,
     resolve_signature_config,
 )
+from dns_cache import DNSCacheTransport
 
 if TYPE_CHECKING:
     from signer import WalletSigner
@@ -78,6 +79,7 @@ class PlatformClient:
             base_url=self._base_url,
             timeout=30.0,
             headers=headers,
+            transport=DNSCacheTransport(),
         )
 
     def get_signer_address(self) -> str:

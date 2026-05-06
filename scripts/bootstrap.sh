@@ -8,7 +8,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # Check Python version (Mine needs 3.11+)
 check_python_version() {
   local py_version
-  py_version=$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0.0")
+  py_version=$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' || echo "0.0")
   local major minor
   major=$(echo "$py_version" | cut -d. -f1)
   minor=$(echo "$py_version" | cut -d. -f2)
