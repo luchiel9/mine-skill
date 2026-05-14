@@ -10,6 +10,14 @@ from typing import Any, Callable
 
 from openclaw_llm import parse_json_response
 
+try:
+    from local_evaluation_engine import is_local_scorer_enabled, local_evaluate
+except ImportError:
+    def is_local_scorer_enabled() -> bool:
+        return False
+    def local_evaluate(*args, **kwargs):
+        return None
+
 log = logging.getLogger("validator.evaluation")
 
 DEFAULT_TIMEOUT = 120
@@ -106,6 +114,9 @@ class EvaluationEngine:
         """
         Single-pass evaluation per protocol: authenticity + consistency + quality in one LLM call.
 
+        When LOCAL_SCORER=1 env var is set, uses deterministic rule-based scoring
+        instead of LLM. Falls back to LLM if local scorer cannot handle the input.
+
         Args:
             cleaned_data: Original miner submission (M0).
             structured_data: Miner-extracted structured data.
@@ -113,6 +124,22 @@ class EvaluationEngine:
             repeat_cleaned_data: Re-crawled data from repeat crawl miner (M1).
             dataset_schema: Full dataset schema definition with types and required fields.
         """
+        # Local scorer bypass: skip LLM entirely for data quality evaluation
+        if is_local_scorer_enabled():
+            local_result = local_evaluate(
+                cleaned_data, structured_data, schema_fields,
+                repeat_cleaned_data=repeat_cleaned_data,
+                dataset_schema=dataset_schema,
+            )
+            if local_result is not None:
+                return EvaluationResult(
+                    result=local_result["result"],
+                    verdict=local_result["verdict"],
+                    consistent=local_result["consistent"],
+                    score=local_result["score"],
+                )
+            log.debug("Local scorer returned None, falling back to LLM")
+
         if isinstance(cleaned_data, dict):
             cleaned_data_str = json.dumps(cleaned_data, ensure_ascii=False, separators=(",", ":"))
         else:
