@@ -134,6 +134,7 @@ class LLMClient:
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
+                "stream": False,
             },
         )
 
